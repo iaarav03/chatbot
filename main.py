@@ -4,11 +4,12 @@ from fastapi.responses import JSONResponse
 from typing import List
 from dotenv import load_dotenv
 
-# LangChain and related imports
+# Updated LangChain imports
 from langchain.prompts.chat import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_ollama import ChatOllama
-from langchain.embeddings.huggingface import HuggingFaceEmbeddings
+# Use the updated HuggingFaceEmbeddings from the new package
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain.vectorstores import Chroma
 from langchain_community.document_loaders import TextLoader, PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -17,20 +18,22 @@ from langchain.chains.history_aware_retriever import create_history_aware_retrie
 from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_core.runnables import RunnablePassthrough
 
-# Load environment variables if needed
+# Load environment variables
 load_dotenv()
 
 app = FastAPI()
 
-# Initialize embeddings and LLM
+# Initialize embeddings using the updated HuggingFaceEmbeddings
 embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-l6-V2")
+
+# Initialize LLM (using ChatOllama)
 llm = ChatOllama(
     model="llama3.1:8b",
     temperature=0.0,
     base_url="http://localhost:11434",
 )
 
-# Global session store to keep track of vectorstores, chains, and chat histories
+# Global session store for vectorstores, chains, and chat histories
 session_data = {}
 
 def get_session_history(session: str) -> ChatMessageHistory:
@@ -56,7 +59,7 @@ contextualize_q_prompt = ChatPromptTemplate.from_messages(
     ]
 )
 
-# System prompt for the QA chain (specialized medical assistant)
+# System prompt for the QA chain (medical information assistant)
 system_prompt = """
 You are a specialized medical information assistant designed to provide accurate, document-based medical information. Your responses must adhere to these strict guidelines:
 
@@ -140,7 +143,7 @@ async def upload_files(
     )
     splits = text_splitter.split_documents(documents)
     
-    # Create the vector store using Chroma
+    # Create the vectorstore using Chroma
     vectorstore = Chroma.from_documents(
         documents=splits,
         embedding=embeddings,
@@ -161,7 +164,7 @@ async def upload_files(
     
     chain = create_chain(history_aware_retriever)
     
-    # Save the vectorstore and chain in the session store
+    # Save vectorstore and chain in the session store
     if session_id not in session_data:
         session_data[session_id] = {}
     session_data[session_id]["vectorstore"] = vectorstore
