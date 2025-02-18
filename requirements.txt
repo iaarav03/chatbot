@@ -13,3 +13,4 @@ requests
 pypdf
 chromadb
 streamlit
+pymongo

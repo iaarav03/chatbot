@@ -1,14 +1,14 @@
 import os
+from typing import List
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
-from typing import List
 from dotenv import load_dotenv
+from pymongo import MongoClient
 
-# Updated LangChain imports
+# LangChain and related imports
 from langchain.prompts.chat import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_ollama import ChatOllama
-# Use the HuggingFaceEmbeddings from the langchain-huggingface package
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain.vectorstores import Chroma
 from langchain_community.document_loaders import TextLoader, PyPDFLoader
@@ -18,31 +18,33 @@ from langchain.chains.history_aware_retriever import create_history_aware_retrie
 from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_core.runnables import RunnablePassthrough
 
-# Load environment variables
+# ======================
+# 1. Load Env Variables
+# ======================
 load_dotenv()
+MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017")
+client = MongoClient(MONGO_URI)
+db = client["mydatabase"]
+sessions_collection = db["sessions"]
 
+# ======================
+# 2. Create FastAPI App
+# ======================
 app = FastAPI()
 
-# Initialize embeddings using the updated HuggingFaceEmbeddings
+# ======================
+# 3. Initialize Embeddings & LLM
+# ======================
 embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-l6-V2")
-
-# Initialize LLM (using ChatOllama)
 llm = ChatOllama(
     model="llama3.1:8b",
     temperature=0.0,
     base_url="http://localhost:11434",
 )
 
-# Global session store for vectorstores, chains, and chat histories
-session_data = {}
-
-def get_session_history(session: str) -> ChatMessageHistory:
-    if session not in session_data:
-        session_data[session] = {}
-        session_data[session]["chat_history"] = ChatMessageHistory()
-    return session_data[session]["chat_history"]
-
-# Prompt to reformulate questions based on chat history
+# ======================
+# 4. System Prompts & Chain Setup
+# ======================
 contextualize_q_system_prompt = """
 Given a chat history and latest user question,
 which might reference context in chat history,
@@ -59,7 +61,6 @@ contextualize_q_prompt = ChatPromptTemplate.from_messages(
     ]
 )
 
-# System prompt for the QA chain (medical information assistant)
 system_prompt = """
 You are a specialized medical information assistant designed to provide accurate, document-based medical information. Your responses must adhere to these strict guidelines:
 
@@ -110,20 +111,35 @@ def create_chain(history_aware_retriever):
     )
     return response_chain.with_config(run_name="retrieval_chain")
 
+# ======================
+# 5. Session Data in Memory (for Chat History)
+# ======================
+session_data = {}
+
+def get_session_history(session_id: str) -> ChatMessageHistory:
+    """Get or create the in-memory ChatMessageHistory for a session."""
+    if session_id not in session_data:
+        session_data[session_id] = {}
+        session_data[session_id]["chat_history"] = ChatMessageHistory()
+    return session_data[session_id]["chat_history"]
+
+# ======================
+# 6. /upload Endpoint
+# ======================
 @app.post("/upload")
 async def upload_files(
     session_id: str = Form(...),
     files: List[UploadFile] = File(...)
 ):
+    # Load and split docs
     documents = []
-    # Process each uploaded file
     for uploaded_file in files:
         temp_path = f"./temp_{uploaded_file.filename}"
         with open(temp_path, "wb") as f:
             content = await uploaded_file.read()
             f.write(content)
         try:
-            if uploaded_file.filename.lower().endswith('.pdf'):
+            if uploaded_file.filename.lower().endswith(".pdf"):
                 loader = PyPDFLoader(temp_path)
             else:
                 loader = TextLoader(temp_path)
@@ -132,55 +148,68 @@ async def upload_files(
         finally:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
-    
+
     if not documents:
         raise HTTPException(status_code=400, detail="No documents loaded.")
-    
-    # Split documents into manageable chunks
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=5000,
-        chunk_overlap=500
-    )
+
+    # Split documents
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=5000, chunk_overlap=500)
     splits = text_splitter.split_documents(documents)
-    
-    # Create the vectorstore using Chroma
+
+    # Store splits in Mongo under this session
+    from langchain.docstore.document import Document
+    splits_dict = []
+    for doc in splits:
+        splits_dict.append({
+            "page_content": doc.page_content,
+            "metadata": doc.metadata
+        })
+
+    sessions_collection.update_one(
+        {"session_id": session_id},
+        {"$set": {"documents": splits_dict}},
+        upsert=True
+    )
+
+    return {"message": "Files processed and documents stored for session.", "session_id": session_id}
+
+# ======================
+# 7. /ask Endpoint
+# ======================
+@app.post("/ask")
+async def ask_question(session_id: str, question: str):
+    # Retrieve docs from Mongo
+    session_record = sessions_collection.find_one({"session_id": session_id})
+    if not session_record or "documents" not in session_record:
+        raise HTTPException(status_code=400, detail="Session not found or no documents uploaded.")
+
+    # Rebuild Document objects
+    from langchain.docstore.document import Document
+    docs = []
+    for d in session_record["documents"]:
+        docs.append(Document(page_content=d["page_content"], metadata=d["metadata"]))
+
+    # Create vectorstore and retriever
     vectorstore = Chroma.from_documents(
-        documents=splits,
+        documents=docs,
         embedding=embeddings,
         collection_metadata={"hnsw:space": "cosine"}
     )
-    
-    # Create retriever and history-aware retriever
-    retriever = vectorstore.as_retriever(
-        search_type="similarity",
-        search_kwargs={"k": 4}
-    )
-    
-    history_aware_retriever = create_history_aware_retriever(
-        llm,
-        retriever,
-        contextualize_q_prompt
-    )
-    
+    retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 4})
+
+    # Build a history-aware retriever
+    history_aware_retriever = create_history_aware_retriever(llm, retriever, contextualize_q_prompt)
+
+    # Create chain
     chain = create_chain(history_aware_retriever)
-    
-    # Save vectorstore and chain in the session store
+
+    # Store chain in memory if you like
     if session_id not in session_data:
         session_data[session_id] = {}
-    session_data[session_id]["vectorstore"] = vectorstore
     session_data[session_id]["chain"] = chain
-    
-    return {"message": "Files processed and vectorstore created for session.", "session_id": session_id}
 
-@app.post("/ask")
-async def ask_question(session_id: str, question: str):
-    if session_id not in session_data or "chain" not in session_data[session_id]:
-        raise HTTPException(status_code=400, detail="Session not found or files not uploaded.")
-    
+    # Use RunnableWithMessageHistory for conversation
     chat_history = get_session_history(session_id)
-    chain = session_data[session_id]["chain"]
-    
-    # Create the conversational chain with message history
     conversational_rag_chain = RunnableWithMessageHistory(
         chain,
         get_session_history,
@@ -188,12 +217,12 @@ async def ask_question(session_id: str, question: str):
         history_messages_key="chat_history",
         output_messages_key="answer"
     )
-    
+
     response = conversational_rag_chain.invoke(
         {"input": question},
         config={"configurable": {"session_id": session_id}}
     )
-    
+
     result = {
         "answer": response.get("answer", ""),
         "sources": [
@@ -204,9 +233,12 @@ async def ask_question(session_id: str, question: str):
             } for doc in response.get("context", [])
         ]
     }
-    
+
     return JSONResponse(content=result)
 
+# ======================
+# 8. Run the App
+# ======================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
