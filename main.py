@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 from langchain.prompts.chat import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_ollama import ChatOllama
-# Use the updated HuggingFaceEmbeddings from the langchain-huggingface package
+# Use the HuggingFaceEmbeddings from the langchain-huggingface package
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain.vectorstores import Chroma
 from langchain_community.document_loaders import TextLoader, PyPDFLoader
